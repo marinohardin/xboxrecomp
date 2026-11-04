@@ -214,6 +214,11 @@ struct nv2a_pb_vsh {
     int      stencil_enable;
     uint32_t stencil_func, stencil_ref, stencil_rmask, stencil_wmask;
     uint32_t stencil_op[3];
+    /* SET_CLIP_MIN / SET_CLIP_MAX (floats, window z) and SET_ZMIN_MAX_CONTROL
+     * (bits 7:4 ZCLAMP_EN: 0 cull fragments outside [clip_min, clip_max],
+     * 1 clamp), as xemu keeps them (BO-332); clip_set once either is set. */
+    uint32_t clip_min, clip_max, zminmax;
+    int      clip_set;
     /* survey */
     uint32_t prog_dwords, prog_loads, prog_starts, const_dwords, const_loads;
     uint32_t mode_sets, ff_matrix_dwords, vp_dwords;
@@ -239,6 +244,21 @@ const struct nv2a_pb_gpu *nv2a_pb_gpu_state(void);
  * the batches that lost indices past NV_MAX_INDICES, and the indices past
  * 0xFFFF truncated to 16 bits. For the backend smoke test. */
 void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_ffff);
+
+/* The walker's block path (BO-282): n parameter words w of one
+ * non-incrementing header on subchannel 0 whose method is ARRAY_ELEMENT16
+ * (0x1800) or INLINE_ARRAY (0x1818), handled as n calls of
+ * nv2a_pb_exec_method would handle them. Returns 0, having done nothing,
+ * for another method or before the executor's first method; the caller
+ * then sends the words one at a time. */
+int nv2a_pb_exec_run(uint32_t method, const uint32_t *w, uint32_t n);
+/* The same for immediate-mode vertex methods (BO-282.12): n parameter
+ * words w of an incrementing header on subchannel 0 from `method`, as
+ * SET_VERTEX3F/4F or SET_VERTEX_DATA* would take them one at a time.
+ * Returns how many it took (the words up to the end of the method range
+ * the run starts in), 0 for another method, before the executor's first
+ * method, or with RECOMP_DEBUG=pb_imm=0. */
+uint32_t nv2a_pb_exec_imm(uint32_t method, const uint32_t *w, uint32_t n);
 const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void);
 const uint32_t *nv2a_pb_tex_regs(void);       /* NV_TEX_REGS words */
 const uint8_t  *nv2a_pb_tex_regs_set(void);   /* 1 where the title wrote one */
