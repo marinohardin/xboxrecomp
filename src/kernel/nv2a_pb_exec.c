@@ -911,6 +911,7 @@ static void dump_present_bmp(void)
  * by commas, spaces or newlines; append to the file rather than rewrite it
  * (a change is seen by its size or time). The file may not exist yet. */
 #include <sys/stat.h>
+static uint32_t s_dumping;      /* the listed flip being written, + 1 */
 static int s_dump_at_n = -1;
 static uint32_t s_dump_at_lo[64], s_dump_at_hi[64];
 static const char *s_dump_at_file;
@@ -1075,10 +1076,31 @@ static void dump_at_flip(uint32_t flip)
     if (!here || !prefix || !nv2a_pb_dump_at_listed(flip))
         return;
     snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix, flip);
+    s_dumping = flip + 1u;
     if (!write_present_bmp(path))
         fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
     else if (s_dump_at_file)    /* a driver waits for this line */
         fprintf(stderr, "  [GPU] fb_dump_at: dumped %s\n", path);
+    s_dumping = 0;
+}
+
+/* RECOMP_DEBUG=fb_dump_host=1 (BO-385): while a listed flip is written, a
+ * backend that writes a scaled target back hands its host pixels here
+ * first, and they go out at their own size beside the guest-size dump, as
+ * <prefix>host_flip_NNNNN.bmp: what render.scale draws, which the 640-wide
+ * dump averages away. */
+void nv2a_pb_dump_host_px(const uint8_t *px, uint32_t hw, uint32_t hh)
+{
+    static int on = -1;
+    const char *prefix = recomp_env(RENV_FB_DUMP);
+    char path[512];
+
+    if (on < 0)
+        on = recomp_env_on(RENV_FB_DUMP_HOST);
+    if (!on || !s_dumping || !prefix || !px)
+        return;
+    snprintf(path, sizeof path, "%shost_flip_%05u.bmp", prefix, s_dumping - 1u);
+    write_bmp_at(path, px, hw * 4u, hw, hh, 4, 0);
 }
 
 /* Write the current surface out as a 24-bit BMP.

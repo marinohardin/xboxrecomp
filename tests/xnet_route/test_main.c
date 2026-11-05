@@ -1486,6 +1486,249 @@ static void test_vote(void)
     CHECK(!xr_is_self(0));
 }
 
+
+/* ── BO-381: the relay fallback ─────────────────────────────────────── */
+#define VPS ip(79, 172, 222, 137)
+
+static void sec_bytes(const char *sec, uint8_t out[16])
+{
+    int i;
+    for (i = 0; i < 16; i++) {
+        unsigned v;
+        sscanf(sec + 2 * i, "%2x", &v);
+        out[i] = (uint8_t)v;
+    }
+}
+
+/* a hello of peer id (title port tport, offset 30900 as its MA says), bits in byte 14 */
+static void mk_hello_of(uint8_t *b, uint32_t id, const char *sec, uint16_t tport, int bits)
+{
+    uint8_t k[16];
+    uint64_t t;
+    int i;
+    sec_bytes(sec, k);
+    memset(b, 0, XR_HELLO_LEN);
+    memcpy(b, "TKDH", 4);
+    b[4] = 2;
+    memcpy(b + 6, &id, 4);
+    b[10] = 0x78; b[11] = 0xb4;
+    b[12] = (uint8_t)(tport >> 8); b[13] = (uint8_t)tport;
+    b[14] = (uint8_t)bits;
+    t = xr_siphash(k, b, 16);
+    for (i = 0; i < 8; i++)
+        b[16 + i] = (uint8_t)(t >> (8 * i));
+}
+
+/* a TKRL datagram as the relay forwards it (kind, game ident, from, to, ports, payload) */
+static int mk_relay(uint8_t *out, const char *sec, int kind, int ident, uint32_t from, uint32_t to,
+                    uint16_t ftp, uint16_t ttp, const uint8_t *payload, int n)
+{
+    uint8_t k[16];
+    uint64_t t;
+    int i;
+    sec_bytes(sec, k);
+    memset(out, 0, XR_RELAY_HDR);
+    memcpy(out, "TKRL", 4);
+    out[4] = 1;
+    out[5] = (uint8_t)kind;
+    out[6] = (uint8_t)(ident >> 24); out[7] = (uint8_t)(ident >> 16); out[8] = (uint8_t)(ident >> 8); out[9] = (uint8_t)ident;
+    memcpy(out + 10, &from, 4);
+    memcpy(out + 14, &to, 4);
+    out[18] = (uint8_t)(ftp >> 8); out[19] = (uint8_t)ftp;
+    out[20] = (uint8_t)(ttp >> 8); out[21] = (uint8_t)ttp;
+    t = xr_siphash(k, out, 24);
+    for (i = 0; i < 8; i++)
+        out[24 + i] = (uint8_t)(t >> (8 * i));
+    memcpy(out + XR_RELAY_HDR, payload, (size_t)n);
+    return XR_RELAY_HDR + n;
+}
+
+static void test_relay(void)
+{
+    const char *SEC = "00112233445566778899aabbccddeeff";
+    const char *ME_ID = "TKADDR=10.64.0.9\n";
+    uint32_t me = ip(10, 64, 0, 9), from, sa = SA;
+    uint8_t h[XR_HELLO_LEN], w[XR_RELAY_HDR + XR_RELAY_PAYLOAD], mine[XR_HELLO_LEN], k[16];
+    uint16_t ftp, ttp;
+    int n, kind, off, i;
+    xr_ep e, c[XR_MAX_CAND], relay;
+    const char *why;
+    int ch;
+    (void)ME_ID;
+    relay = ep(VPS, 21811);
+    sec_bytes(SEC, k);
+
+    react_receiver(SEC);                       /* our game 3: SA and SB, the secret */
+    CHECK(xr_relay_port_seen() == 0);
+    lobby("IDENT=3\nTKRELAY=21811\n");
+    CHECK(xr_relay_port_seen() == 21811);
+    lobby("TKRELAY=70000\n");
+    CHECK(xr_relay_port_seen() == 0);          /* not a port */
+    lobby("TKRELAY=21811\n");
+    xr_relay_set(VPS, 21811);
+    xr_relay_game(3);
+    CHECK(xr_relay_ep().ip == VPS && xr_relay_ep().port == 21811);
+    CHECK(xr_is_relay_src(relay) && !xr_is_relay_src(ep(VPS, 21810)));
+
+    /* direct first: the relay is wanted only 2 s after our hellos to the peer began */
+    CHECK(!xr_relay_want(SA, 1000, 1000));
+    CHECK(xr_hello_due(SA, 1000, 1000));
+    CHECK(!xr_relay_want(SA, 1000, 1500));
+    CHECK(!xr_relay_want(SA, 1000, 2999));
+    CHECK(xr_relay_want(SA, 1000, 3000));
+    xr_relay_off(1);
+    CHECK(!xr_relay_want(SA, 1000, 3000));
+    xr_relay_off(0);
+    CHECK(!xr_relay_want(RC, 1000, 3000));     /* not a member */
+    /* the route is still the direct guess, nothing relayed */
+    CHECK(xr_route(SA, 1000, &e, &why, &ch) == 1 && e.ip == AWAY);
+    CHECK(!xr_route_is_relay(SA, 1000));
+
+    /* wrapping our own hello for the relay */
+    xr_hello_make_for(mine, 1000, SA);
+    CHECK((mine[14] & 2) == 0);                /* no direct hello of SA came yet */
+    n = xr_relay_wrap(w, (int)sizeof w, SA, 1000, 1000, mine, XR_HELLO_LEN);
+    CHECK(n == XR_RELAY_HDR + XR_HELLO_LEN);
+    CHECK(xr_is_relay_pkt(w, n) && !xr_is_relay_pkt(w, 10));
+    CHECK(w[5] == XR_RELAY_DATA && w[9] == 3 && !memcmp(w + 10, &me, 4) && !memcmp(w + 14, &sa, 4));
+    CHECK(w[18] == 3 && w[19] == 0xE8 && w[20] == 3 && w[21] == 0xE8);
+    CHECK(!memcmp(w + XR_RELAY_HDR, mine, XR_HELLO_LEN));
+    {
+        uint64_t t = xr_siphash(k, w, 24);
+        for (i = 0; i < 8; i++)
+            CHECK(w[24 + i] == (uint8_t)(t >> (8 * i)));
+    }
+    /* our own packet back (from = us): refused; too long: not made */
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_BAD);
+    CHECK(xr_relay_wrap(w, (int)sizeof w, SA, 1000, 1000, mine, XR_RELAY_PAYLOAD + 1) == 0);
+    CHECK(xr_relay_wrap(w, 40, SA, 1000, 1000, mine, XR_HELLO_LEN) == 0);
+
+    /* SA's hello through the relay: a relay path, the datagrams go wrapped */
+    mk_hello_of(h, SA, SEC, 1000, 1);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, SA, me, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_OK);
+    CHECK(from == SA && ftp == 1000 && ttp == 1000 && kind == XR_RELAY_DATA && off == XR_RELAY_HDR);
+    CHECK(xr_relay_hello_seen(SA, 1000, 1000, w + off, n - off, 3200) == XR_HELLO_NEW);
+    CHECK(xr_relay_hello_seen(SA, 1000, 1000, w + off, n - off, 3300) == XR_HELLO_OLD);
+    CHECK(xr_route(SA, 1000, &e, &why, &ch) == 1 && e.ip == VPS && e.port == 21811 && strstr(why, "relay"));
+    CHECK(xr_route_is_relay(SA, 1000));
+    CHECK(!xr_route_is_relay(SA, 6000));
+    CHECK(xr_relay_want(SA, 1000, 3300));      /* it reached us that way: answer in kind */
+    /* the hellos keep trying the direct paths: the guess, never the relay */
+    n = xr_candidates(SA, 1000, c);
+    CHECK(n >= 1 && c[0].ip == AWAY);
+    for (i = 0; i < n; i++)
+        CHECK(!(c[i].ip == VPS && c[i].port == 21811));
+    /* and stay fast for a while (direct may still be found), then slow down */
+    CHECK(xr_hello_due(SA, 1000, 3300));
+    CHECK(!xr_hello_due(SA, 1000, 3500));
+    CHECK(xr_hello_due(SA, 1000, 3900));
+    CHECK(xr_hello_due(SA, 1000, 25000));
+    CHECK(!xr_hello_due(SA, 1000, 26000));
+    CHECK(xr_hello_due(SA, 1000, 41000));
+    /* the relay's answer: SA's endpoint for that port, one more direct candidate */
+    {
+        uint8_t ans[XR_RELAY_HDR + 6], pl[6];
+        uint32_t ipv = ip(85, 66, 10, 7);
+        memcpy(pl, &ipv, 4);
+        pl[4] = 0xD4; pl[5] = 0x31;            /* 54321 */
+        /* the server answers with from = the peer, from-port = the peer's port, to-port = ours */
+        n = mk_relay(ans, SEC, XR_RELAY_ANSWER, 3, SA, me, 1000, 6000, pl, 6);
+        CHECK(xr_relay_unwrap(ans, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_OK && kind == XR_RELAY_ANSWER);
+        CHECK(from == SA && ftp == 1000 && ttp == 6000);
+        xr_relay_answer(from, ftp, ep(ipv, 54321));
+        n = xr_candidates(SA, 1000, c);
+        for (i = 0; i < n; i++)
+            if (c[i].ip == ipv && c[i].port == 54321)
+                break;
+        CHECK(i < n);
+        /* a private address the relay cannot have seen for a peer elsewhere: ignored */
+        xr_relay_answer(SA, 6000, ep(ip(192, 168, 7, 7), 31000));
+        n = xr_candidates(SA, 6000, c);
+        for (i = 0; i < n; i++)
+            CHECK(c[i].ip != ip(192, 168, 7, 7));
+    }
+    /* a direct hello from SA without bit 1 (it does not hear us directly): the relay stays */
+    mk_hello_of(h, SA, SEC, 1000, 1);
+    CHECK(xr_hello_seen(ep(AWAY, 54321), h, XR_HELLO_LEN, &from, 42000) == XR_HELLO_ONEWAY);
+    CHECK(xr_route_is_relay(SA, 1000));
+    /* but our next hello tells it we hear it directly (bit 1, the tag redone) */
+    xr_hello_make_for(mine, 1000, SA);
+    CHECK((mine[14] & 2) != 0);
+    {
+        uint64_t t = xr_siphash(k, mine, 16);
+        for (i = 0; i < 8; i++)
+            CHECK(mine[16 + i] == (uint8_t)(t >> (8 * i)));
+    }
+    xr_hello_make_for(mine, 6000, SA);
+    CHECK((mine[14] & 2) == 0);                /* per port */
+    /* with bit 1 from it as well: the direct path takes over */
+    mk_hello_of(h, SA, SEC, 1000, 3);
+    CHECK(xr_hello_seen(ep(AWAY, 54321), h, XR_HELLO_LEN, &from, 42500) == XR_HELLO_NEW);
+    CHECK(xr_route(SA, 1000, &e, &why, &ch) == 1 && e.ip == AWAY && e.port == 54321);
+    CHECK(!xr_route_is_relay(SA, 1000));
+    CHECK(!xr_relay_want(SA, 1000, 43000));    /* a direct path: no more relay hellos */
+    /* a relayed hello while the direct path is fresh: the direct one stays */
+    mk_hello_of(h, SA, SEC, 1000, 3);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, SA, me, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_hello_seen(SA, 1000, 1000, w + XR_RELAY_HDR, XR_HELLO_LEN, 43000) == XR_HELLO_OLD);
+    CHECK(!xr_route_is_relay(SA, 1000));
+    /* ... and takes over once the direct one went quiet */
+    CHECK(xr_relay_hello_seen(SA, 1000, 1000, w + XR_RELAY_HDR, XR_HELLO_LEN, 80000) == XR_HELLO_NEW);
+    CHECK(xr_route_is_relay(SA, 1000));
+
+    /* refusals: a bad tag, another game, a non-member, not for us, short, a mismatching hello */
+    mk_hello_of(h, SA, SEC, 1000, 1);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, SA, me, 1000, 1000, h, XR_HELLO_LEN);
+    w[30] ^= 1;
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_BADTAG);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 4, SA, me, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_UNKNOWN);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, RC, me, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_UNKNOWN);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, SA, SB, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_NOTME);
+    n = mk_relay(w, SEC, XR_RELAY_DATA, 3, SA, me, 1000, 1000, h, XR_HELLO_LEN);
+    CHECK(xr_relay_unwrap(w, 20, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_BAD);
+    w[5] = 7;
+    CHECK(xr_relay_unwrap(w, n, &from, &ftp, &ttp, &kind, &off) == XR_RELAY_BAD);
+    mk_hello_of(h, SB, SEC, 1000, 1);          /* the wrapper says SA, the hello SB */
+    CHECK(xr_relay_hello_seen(SA, 1000, 1000, h, XR_HELLO_LEN, 6000) == XR_HELLO_BAD);
+    /* without a relay (an old server) nothing is wrapped or wanted */
+    xr_relay_set(0, 0);
+    CHECK(xr_relay_wrap(w, (int)sizeof w, SA, 1000, 1000, mine, XR_HELLO_LEN) == 0);
+    CHECK(!xr_relay_want(SA, 1000, 9000));
+    CHECK(!xr_route_is_relay(SA, 1000));
+    xr_relay_set(VPS, 21811);
+
+    /* a ping through the relay: trusted for that one call, from the relay's endpoint */
+    {
+        uint8_t pg[XR_PING_LEN], reply[XR_PING_LEN];
+        unsigned ms;
+        uint64_t t;
+        memset(pg, 0, sizeof pg);
+        memcpy(pg, "TKPG", 4);
+        pg[4] = 1; pg[5] = XR_PING_PING;
+        memcpy(pg + 6, &sa, 4);
+        pg[13] = 9;
+        t = xr_siphash(k, pg, 24);
+        for (i = 0; i < 8; i++)
+            pg[24 + i] = (uint8_t)(t >> (8 * i));
+        CHECK(xr_ping_seen(relay, pg, XR_PING_LEN, &from, reply, &ms, 7000) == XR_PING_WRONGSRC);
+        xr_relay_trust(SA);
+        CHECK(xr_ping_seen(relay, pg, XR_PING_LEN, &from, reply, &ms, 7000) == XR_PING_ANSWER_IT);
+        xr_relay_trust(SB);                    /* trust is for the named peer only */
+        pg[13] = 10;
+        t = xr_siphash(k, pg, 24);
+        for (i = 0; i < 8; i++)
+            pg[24 + i] = (uint8_t)(t >> (8 * i));
+        CHECK(xr_ping_seen(relay, pg, XR_PING_LEN, &from, reply, &ms, 7400) == XR_PING_WRONGSRC);
+    }
+    /* a new lobby session forgets the relay (the next member record names it again) */
+    xr_session_reset();
+    CHECK(xr_relay_ep().port == 0 && xr_relay_port_seen() == 0);
+}
+
 static void test_react_rate(void)
 {
     const char *SEC = "00112233445566778899aabbccddeeff";
@@ -1700,6 +1943,7 @@ int main(void)
     test_vote();
     test_ping();
     test_react_rate();
+    test_relay();
     printf("%d checks, %d failed\n", checks, fails);
     return fails != 0;
 }

@@ -612,6 +612,9 @@ static void init_once(void)
     s_force_public = e && *e && *e != '0';
     xr_self(s_local_ip, s_port_offset, s_force_public);
     xr_self_lan(real_lan);
+    /* BO-381: the relay fallback can be turned off (tests, the rig) */
+    e = getenv("TAKEDAWN_NET_RELAY");
+    xr_relay_off(e && *e && *e == '0');
     /* Internet mode: the host's race port (the title's 1000) through the
      * router, by UPnP when the router has it. */
     if (s_on == 1)
@@ -1194,6 +1197,21 @@ static void lobby_packet(const uint8_t *hd, const char *body, int bl)
     if (member) {
         xl_game g;
         xr_members_body(body, bl);
+        /* BO-381: the lobby's relay (TKRELAY=<port> next to the secret), and
+         * the game the relay knows us in */
+        if (xl_key_int(body, bl, "IDENT", &id) && id > 0)
+            xr_relay_game(id);
+        {
+            uint16_t rp = xr_relay_port_seen();
+            xr_ep was = xr_relay_ep();
+            if (rp) {
+                xr_relay_set(s_lobby_ip, rp);
+                if (!was.port || was.port != rp)
+                    xnet_hle_log("the lobby runs a relay on UDP %u: a player whose hello does not come in %u s is"
+                                 " reached through it (direct stays the first choice)", (unsigned)rp,
+                                 (unsigned)(XR_RELAY_AFTER_MS / 1000u));
+            }
+        }
         if (xl_game_body(body, bl, &g)) {
             char a[160], b[160];
             xl_game_line(&s_game, a, sizeof a);
@@ -2537,20 +2555,34 @@ int xnet_hle_peer_rtt(uint32_t title_ip, unsigned *min_ms, unsigned *med_ms, int
     return 1;
 }
 
+static void relay_send(host_sock fd, const uint8_t *wrapped, int n);
+
+/* BO-381: whether a relay is known (its datagrams need our own buffer) */
+static int relay_known(void)
+{
+    int r;
+    lock();
+    r = xr_relay_ep().port != 0;
+    unlock();
+    return r;
+}
+
 static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                       void *from, int32_t *fromlen, int *werr)
 {
     struct sockaddr_in h, hsrc;
     socklen_t hn = sizeof h;
     int n, rounds = 0, known = 0;
-    uint32_t kid = 0;
-    uint16_t ktp = 0;
+    uint32_t kid = 0, rl_from = 0;
+    uint16_t ktp = 0, rl_ftp = 0;
     /* with the switch on a wrapped datagram may be longer than the title's
-     * buffer: read to our own */
-    uint8_t simbuf[XN_MAX_DGRAM + SIM_WRAP];
+     * buffer: read to our own; so may a relayed one (BO-381), so our own
+     * buffer whenever a relay is known (own: copied out at the end) */
+    uint8_t simbuf[XN_MAX_DGRAM + SIM_WRAP + XR_RELAY_HDR];
     int sim = xn_on() && k->type == X_SOCK_DGRAM && !(flags & X_MSG_PEEK);
-    void *buf = sim ? (void *)simbuf : ubuf;
-    int len = sim ? (int)sizeof simbuf : ulen;
+    int own = sim || (k->type == X_SOCK_DGRAM && relay_known());
+    void *buf = own ? (void *)simbuf : ubuf;
+    int len = own ? (int)sizeof simbuf : ulen;
     for (;;) {
         xr_ep src;
         uint32_t id = 0;
@@ -2584,7 +2616,8 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                 int peer;
                 lock();
                 peer = xr_is_hello((const uint8_t *)buf, n) || xr_is_ping((const uint8_t *)buf, n) ||
-                       xr_is_react((const uint8_t *)buf, n) || xr_known_source(src);
+                       xr_is_react((const uint8_t *)buf, n) || xr_known_source(src) ||
+                       (xr_is_relay_pkt((const uint8_t *)buf, n) && xr_is_relay_src(src));
                 if (peer)
                     xn_push(XN_IN, s, buf, n, src.ip, src.port, now);
                 unlock();
@@ -2597,6 +2630,47 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                 }
             }
         }
+        /* BO-381: a datagram the relay forwarded: checked and unwrapped
+         * here; what is inside then goes its usual way, as the peer's */
+        rl_from = 0;
+        if (xr_is_relay_pkt((const uint8_t *)buf, n)) {
+            uint32_t from = 0;
+            uint16_t ftp = 0, ttp = 0;
+            int kind = 0, off = 0, rr;
+            lock();
+            rr = xr_is_relay_src(src) ? xr_relay_unwrap((const uint8_t *)buf, n, &from, &ftp, &ttp, &kind, &off)
+                                      : XR_RELAY_UNKNOWN;
+            if (rr == XR_RELAY_OK && kind == XR_RELAY_ANSWER && n - off >= 6) {
+                /* the peer's endpoint as the relay saw it: a direct candidate
+                 * (the answer's from-port is the peer's port, its to-port ours) */
+                xr_ep d;
+                const uint8_t *q = (const uint8_t *)buf + off;
+                memcpy(&d.ip, q, 4);
+                d.port = (uint16_t)(q[4] << 8 | q[5]);
+                xr_relay_answer(from, ftp, d);
+            }
+            unlock();
+            if (rr == XR_RELAY_OK && kind == XR_RELAY_DATA && ttp == k->tport && n - off > 0) {
+                rl_from = from;
+                rl_ftp = ftp;
+                n -= off;
+                memmove(buf, (const uint8_t *)buf + off, (size_t)n);
+            } else {
+                if (flags & X_MSG_PEEK) {
+                    uint8_t drop[64];
+                    recvfrom(k->fd, (char *)drop, sizeof drop, 0, NULL, NULL);
+                }
+                if (rr != XR_RELAY_OK && xr_log_ok(now)) {
+                    char b1[40];
+                    xnet_hle_log("relayed datagram from %s refused (%d)", sa_str(&h, b1, sizeof b1), rr);
+                }
+                if (++rounds >= 32) {
+                    *werr = WSAEWOULDBLOCK;
+                    return X_SOCKET_ERROR;
+                }
+                continue;
+            }
+        }
         if (xr_is_ping((const uint8_t *)buf, n)) {
             /* a peer's ping or its answer (BO-357): before the title, as the hellos */
             uint8_t reply[XR_PING_LEN];
@@ -2606,9 +2680,20 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                 recvfrom(k->fd, (char *)drop, sizeof drop, 0, NULL, NULL);
             }
             lock();
+            if (rl_from)
+                xr_relay_trust(rl_from);
             r = xr_ping_seen(src, (const uint8_t *)buf, n, &id, reply, &ms, now);
             unlock();
-            if (r == XR_PING_ANSWER_IT && !sim_out(s, reply, XR_PING_LEN, &h))
+            if (r == XR_PING_ANSWER_IT && rl_from) {
+                /* back the way it came: through the relay */
+                uint8_t w[XR_RELAY_HDR + XR_PING_LEN];
+                int nw;
+                lock();
+                nw = xr_relay_wrap(w, (int)sizeof w, rl_from, k->tport, rl_ftp, reply, XR_PING_LEN);
+                unlock();
+                if (nw > 0)
+                    relay_send(k->fd, w, nw);
+            } else if (r == XR_PING_ANSWER_IT && !sim_out(s, reply, XR_PING_LEN, &h))
                 sendto(k->fd, (const char *)reply, XR_PING_LEN, 0, (struct sockaddr *)&h, sizeof h);
             if ((r == XR_PING_UNKNOWN || r == XR_PING_BADTAG || r == XR_PING_WRONGSRC) && xr_log_ok(now)) {
                 char b1[40];
@@ -2624,6 +2709,8 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
             {
                 int kind = 0, value = 0;
                 lock();
+                if (rl_from)
+                    xr_relay_trust(rl_from);
                 r = xr_react_seen(src, (const uint8_t *)buf, n, &id, &kind, &value, now);
                 unlock();
                 /* duplicates (the double-send) and over-limit packets are
@@ -2642,6 +2729,8 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                 recvfrom(k->fd, (char *)drop, sizeof drop, 0, NULL, NULL);
             }
             lock();
+            if (rl_from)
+                xr_relay_trust(rl_from);
             r = xr_vote_seen(src, (const uint8_t *)buf, n, &id, now);
             unlock();
             if ((r == XR_REACT_UNKNOWN || r == XR_REACT_BADTAG || r == XR_REACT_WRONGSRC) && xr_log_ok(now)) {
@@ -2654,17 +2743,45 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
                 recvfrom(k->fd, (char *)drop, sizeof drop, 0, NULL, NULL);
             }
             lock();
-            r = xr_hello_seen_on(src, k->tport, (const uint8_t *)buf, n, &id, now);
+            if (rl_from)
+                r = xr_relay_hello_seen(rl_from, rl_ftp, k->tport, (const uint8_t *)buf, n, now);
+            else
+                r = xr_hello_seen_on(src, k->tport, (const uint8_t *)buf, n, &id, now);
             unlock();
-            if (r != XR_HELLO_OLD && (r == XR_HELLO_NEW || xr_log_ok(now))) {
+            if (rl_from)
+                id = rl_from;
+            if (r == XR_HELLO_ONEWAY) {
+                /* once per peer and path: the other side is not there yet */
+                static uint32_t said_id;
+                static uint16_t said_port;
+                if (said_id != id || said_port != src.port) {
+                    char b1[40];
+                    struct in_addr a;
+                    said_id = id;
+                    said_port = src.port;
+                    a.s_addr = id;
+                    xnet_hle_log("direct hello from %s (the player at %s) while on the relay: our direct hellos do not"
+                                 " reach it yet, the relay stays", sa_str(&h, b1, sizeof b1), inet_ntoa(a));
+                }
+            } else if (r != XR_HELLO_OLD && (r == XR_HELLO_NEW || xr_log_ok(now))) {
                 char b1[40];
                 struct in_addr a;
                 a.s_addr = id;
-                if (r == XR_HELLO_NEW)
+                if (r == XR_HELLO_NEW && rl_from)
+                    xnet_hle_log("hello through the relay (%s): that is the player at %s; its datagrams come that way"
+                                 " until a direct path works both ways", sa_str(&h, b1, sizeof b1), inet_ntoa(a));
+                else if (r == XR_HELLO_NEW)
                     xnet_hle_log("hello from %s: that is the player at %s", sa_str(&h, b1, sizeof b1), inet_ntoa(a));
                 else
                     xnet_hle_log("hello from %s refused: %s", sa_str(&h, b1, sizeof b1), hello_refusal(r));
             }
+        } else if (rl_from) {
+            /* the title's datagram through the relay: the wrapper named the
+             * player and its port, and the tag was checked */
+            known = 1;
+            kid = rl_from;
+            ktp = rl_ftp;
+            break;
         } else {
             lock();
             known = xr_source_on(src, k->tport, &kid, &ktp);
@@ -2709,7 +2826,7 @@ static int recvfrom_k(xsock *k, uint32_t s, void *ubuf, int ulen, int flags,
         dump_from("recvfrom", s, buf, n, b2);
     }
     tsdump("rx", buf, n);
-    if (sim) {
+    if (own) {
         if (n > ulen)
             n = ulen;
         memcpy(ubuf, buf, (size_t)n);
@@ -3002,6 +3119,24 @@ int xnet_hle_send(uint32_t s, const void *buf, int len, int flags, int *werr)
     return r;
 }
 
+/* BO-381: a wrapped datagram to the relay, from the socket whose path it
+ * carries (the relay binds that socket's own router mapping) */
+static void relay_send(host_sock fd, const uint8_t *wrapped, int n)
+{
+    struct sockaddr_in to;
+    xr_ep r;
+    lock();
+    r = xr_relay_ep();
+    unlock();
+    if (!r.port)
+        return;
+    memset(&to, 0, sizeof to);
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = r.ip;
+    to.sin_port = htons(r.port);
+    sendto(fd, (const char *)wrapped, (size_t)n, 0, (struct sockaddr *)&to, sizeof to);
+}
+
 /* Hellos to peer tip from each of the title's UDP sockets (1000, 6000 ...),
  * to the same port of the peer, when one is due: a socket that only
  * receives would otherwise never open its path through the routers. */
@@ -3010,10 +3145,10 @@ static void hellos_from_all(uint32_t tip)
     int i, c, nc;
     for (i = 0; i < MAX_SOCK; i++) {
         struct sockaddr_in to;
-        uint8_t hello[XR_HELLO_LEN];
-        xr_ep ep, cand[2];
+        uint8_t hello[XR_HELLO_LEN], wrapped[XR_RELAY_HDR + XR_HELLO_LEN];
+        xr_ep ep, cand[XR_MAX_CAND];
         const char *why;
-        int ch, due = 0;
+        int ch, due = 0, nw = 0;
         host_sock fd;
         uint16_t myport;
         lock();
@@ -3028,8 +3163,10 @@ static void hellos_from_all(uint32_t tip)
         (void)ch;
         if (xr_route(tip, myport, &ep, &why, NULL) == 1 && xr_hello_due(tip, myport, now_ms())) {
             due = 1;
-            xr_hello_make(hello, myport);
+            xr_hello_make_for(hello, myport, tip);
             nc = xr_candidates(tip, myport, cand);
+            if (xr_relay_want(tip, myport, now_ms()))
+                nw = xr_relay_wrap(wrapped, (int)sizeof wrapped, tip, myport, myport, hello, (int)sizeof hello);
         }
         unlock();
         if (due && xr_has_secret()) {
@@ -3046,6 +3183,8 @@ static void hellos_from_all(uint32_t tip)
             to.sin_port = htons(cand[c].port);
             sendto(fd, (const char *)hello, sizeof hello, 0, (struct sockaddr *)&to, sizeof to);
         }
+        if (nw > 0)
+            relay_send(fd, wrapped, nw);
         release(&s_tab[i]);
     }
 }
@@ -3063,12 +3202,13 @@ static int sendto_k(xsock *k, uint32_t s, const void *buf, int len, int flags,
     to_host_sa(to, tolen, &h);
     pin_source(k);
     {
-        xr_ep ep, cand[2];
+        xr_ep ep, cand[XR_MAX_CAND];
         const char *why = NULL;
-        int routed = 0, changed = 0, due = 0, nc = 0, c;
+        int routed = 0, changed = 0, due = 0, nc = 0, c, nw = 0, relayed = 0, nd = 0;
         uint32_t tip = h.sin_addr.s_addr;
         uint16_t tport = ntohs(h.sin_port);
-        uint8_t hello[XR_HELLO_LEN];
+        uint8_t hello[XR_HELLO_LEN], wrapped[XR_RELAY_HDR + XR_HELLO_LEN];
+        uint8_t data[XR_RELAY_HDR + XR_RELAY_PAYLOAD];
         if (k->type == X_SOCK_DGRAM) {
             struct sockaddr_in me;
             socklen_t mn = sizeof me;
@@ -3081,8 +3221,15 @@ static int sendto_k(xsock *k, uint32_t s, const void *buf, int len, int flags,
             routed = xr_route(tip, tport, &ep, &why, &changed);
             due = routed == 1 && myport && xr_hello_due(tip, tport, now_ms());
             if (due) {
-                xr_hello_make(hello, myport);
+                xr_hello_make_for(hello, myport, tip);
                 nc = xr_candidates(tip, tport, cand);
+                if (xr_relay_want(tip, tport, now_ms()))
+                    nw = xr_relay_wrap(wrapped, (int)sizeof wrapped, tip, myport, tport, hello, (int)sizeof hello);
+            }
+            /* BO-381: the route is the relay: the datagram goes wrapped */
+            if (routed == 1 && myport && xr_route_is_relay(tip, tport)) {
+                relayed = 1;
+                nd = xr_relay_wrap(data, (int)sizeof data, tip, myport, tport, (const uint8_t *)buf, len);
             }
             unlock();
             if (routed == 1)
@@ -3114,8 +3261,29 @@ static int sendto_k(xsock *k, uint32_t s, const void *buf, int len, int flags,
                 hh.sin_port = htons(cand[c].port);
                 sendto(k->fd, (const char *)hello, sizeof hello, 0, (struct sockaddr *)&hh, sizeof hh);
             }
+            if (nw > 0)
+                relay_send(k->fd, wrapped, nw);
         } else {
             port_out(&h, k->type == X_SOCK_DGRAM);
+        }
+        if (relayed) {
+            /* through the relay (h is its endpoint): the wrapped datagram,
+             * or nothing when it does not fit (the title's are far shorter) */
+            if (nd <= 0) {
+                tsdump("tx-refused", buf, len);
+                return len;
+            }
+            do {
+                n = (int)sendto(k->fd, (const char *)data, (size_t)nd, 0, (struct sockaddr *)&h, sizeof h);
+            } while (n < 0 && interrupted());
+            if (n < 0) {
+                *werr = map_err(host_errno());
+                return X_SOCKET_ERROR;
+            }
+            if (trace_n(&count))
+                xnet_hle_log("sendto(%u, %s) %d bytes through the relay", s, sa_str(&h, b, sizeof b), len);
+            tsdump("tx", buf, len);
+            return len;
         }
         if (routed == 1 && k->type == X_SOCK_DGRAM && sim_out(s, buf, len, &h)) {
             tsdump("tx", buf, len);
@@ -3212,9 +3380,10 @@ static void reacts_from_all(uint32_t tip, const uint8_t *buf, int n)
     int i, c, nc;
     for (i = 0; i < MAX_SOCK; i++) {
         struct sockaddr_in to;
-        xr_ep ep, cand[2];
+        xr_ep ep, cand[XR_MAX_CAND];
+        uint8_t wrapped[XR_RELAY_HDR + XR_VOTE_LEN];
         const char *why;
-        int got = 0;
+        int got = 0, nw = 0;
         host_sock fd;
         uint16_t myport;
         lock();
@@ -3229,6 +3398,8 @@ static void reacts_from_all(uint32_t tip, const uint8_t *buf, int n)
         if (xr_route(tip, myport, &ep, &why, NULL) == 1) {
             got = 1;
             nc = xr_candidates(tip, myport, cand);
+            if (xr_route_is_relay(tip, myport))
+                nw = xr_relay_wrap(wrapped, (int)sizeof wrapped, tip, myport, myport, buf, n);
         }
         unlock();
         for (c = 0; got && c < nc; c++) {
@@ -3239,6 +3410,8 @@ static void reacts_from_all(uint32_t tip, const uint8_t *buf, int n)
             if (!sim_out(HANDLE_BASE + (uint32_t)i, buf, n, &to))
                 sendto(fd, (const char *)buf, (size_t)n, 0, (struct sockaddr *)&to, sizeof to);
         }
+        if (nw > 0)
+            relay_send(fd, wrapped, nw);
         release(&s_tab[i]);
     }
 }

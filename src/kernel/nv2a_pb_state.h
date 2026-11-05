@@ -292,6 +292,11 @@ const struct nv2a_pb_present *nv2a_pb_present_state(void);
  * presents from its own surfaces (D3D11) asks this at each present and dumps
  * the frame itself, as <prefix>flip_NNNNN.bmp. */
 int nv2a_pb_dump_at_listed(uint32_t flip);
+/* RECOMP_DEBUG=fb_dump_host=1: a scaled target's host pixels (BGRA, hw x
+ * hh, rows hw * 4 bytes) while a listed flip is dumped, written beside it as
+ * <prefix>host_flip_NNNNN.bmp; nothing otherwise. For the GPU backends'
+ * scaled write-back. */
+void nv2a_pb_dump_host_px(const uint8_t *px, uint32_t hw, uint32_t hh);
 
 /* Stream marks (BO-110): a place in the title's push buffer that a host
  * names from the guest's thread, as the title builds the stream. `va` is

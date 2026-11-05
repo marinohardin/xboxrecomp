@@ -682,6 +682,37 @@ uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
                            uint32_t base, uint32_t *out,
                            enum nv2a_topology *topo);
 
+/* BO-385, lines at a render scale above 1. The NV2A draws a line one pixel
+ * wide and has no width to set; xemu draws it surface_scale_factor pixels
+ * wide (glLineWidth in pgraph/gl/draw.c, a dynamic vkCmdSetLineWidth in
+ * pgraph/vk/draw.c where the device has wideLines), so a line looks as at
+ * 1x at any scale. Metal has no line width at all and Vulkan's wideLines is
+ * optional (Adreno), so here a line list of a scaled target becomes two
+ * triangles a segment, one guest pixel wide, drawn by the backend's
+ * pass-through vertex stage (vs_pass and its twins): the batch's vertices
+ * are run through the vertex program on the CPU (nv2a_vsh_run, as the
+ * software rasteriser does) or, without a program, taken as the
+ * pre-transformed vertices they are.
+ *
+ * nv2a_wide_lines: whether a draw of this topology into a target w guest
+ * pixels wide drawn hw host pixels wide is expanded (not at 1x, not with
+ * RECOMP_DEBUG=wide_lines=0, not with fog on, which the pass-through stage
+ * does not carry).
+ *
+ * nv2a_lines_expand: the n indices at lidx (line list pairs, rebased by
+ * -lo, of `count` vertices from lo) into out, NV2A_WL_F4 float4s a vertex
+ * (the pass-through layout: position in surface pixels with 1/w, oD0, oD1,
+ * oT0..oT3), and oidx, a triangle list. Room: 2 * n vertices and 3 * n
+ * indices. A segment with an end the program could not place (behind the
+ * eye, not finite) is left out. Returns the index count (6 a segment); the
+ * vertex count is two thirds of it. */
+#define NV2A_WL_F4 7
+int nv2a_wide_lines(const struct nv2a_pb_vsh *v, enum nv2a_topology topo,
+                    uint32_t w, uint32_t hw);
+uint32_t nv2a_lines_expand(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v,
+                           const uint32_t *lidx, uint32_t n, uint32_t lo, uint32_t count,
+                           const uint8_t *mem, float *out, uint32_t *oidx);
+
 /* FNV-1a over the vertex program's slots, from v->start through the slot
  * with the FINAL bit (or the end). *len, if given, gets the slot count. */
 uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len);

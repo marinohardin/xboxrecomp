@@ -54,6 +54,7 @@ set(KERNEL_SOURCES
     nv2a_texup.c
     nv2a_filmup.c
     nv2a_vsh_cpu.c
+    nv2a_wide_lines.c
     nv2a_combiner.c
 )
 

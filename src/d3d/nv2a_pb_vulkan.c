@@ -6880,6 +6880,8 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     const Stage *rstage = NULL;
     const struct nv2a_texrep_hdr_gain *hgain = NULL;
     int solo = 0;                     /* BO-203: stage 0 is a stage0_only HDR picture */
+    int wide = 0;                     /* BO-385: a line list drawn as quads (vs_pass) */
+    int prog = d->program;            /* the batch runs its program on the GPU */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
     VkImageView sview[4];
@@ -6986,7 +6988,18 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         s_draws_skipped++;
         return;
     }
-    if (v->cull_enable) {
+    /* BO-385: a line one guest pixel wide at any render scale, as two
+     * triangles a segment through vs_pass (nv2a_lines_expand), as Metal;
+     * wideLines is optional and not on every device this runs on. */
+    if (nv2a_wide_lines(v, topo, rt->w, rt->hw)) {
+        wide = 1;
+        prog = 0;
+        vmod = s_vs_pass;
+        nf4 = VTX_F4;
+        topo = NV2A_TOPO_TRIANGLES;
+        count = 2u * nidx;            /* four corners a segment */
+    }
+    if (v->cull_enable && !wide) {
         if (v->cull_face == 0x405)      cull = 1;   /* BACK */
         else if (v->cull_face == 0x404) cull = 2;   /* FRONT */
         else if (v->cull_face == 0x408) cull_all = 1;
@@ -7142,8 +7155,9 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
     for (tries = 0; tries < 2; tries++) {
         uint64_t fl = s_flushes;
         vf = (float *)ring_alloc(RING_VB, vbytes, 16, &vb_off);
-        ip = vf ? ring_alloc(RING_IB, (VkDeviceSize)nidx * 4u, 16, &ib_off) : NULL;
-        if (vf && ip && d->program && !ubo_place(0, v->c, VS_C_BYTES, &uo[0]))
+        ip = vf ? ring_alloc(RING_IB, (VkDeviceSize)(wide ? 3u * nidx : nidx) * 4u, 16, &ib_off)
+                : NULL;
+        if (vf && ip && prog && !ubo_place(0, v->c, VS_C_BYTES, &uo[0]))
             ip = NULL;
         if (vf && ip && !ubo_place(1, &vc, VP_C_BYTES, &uo[1]))
             ip = NULL;
@@ -7158,12 +7172,21 @@ static void vk_on_draw(const struct nv2a_pb_draw *d)
         s_draws_skipped++;
         return;
     }
-    if (!d->program)
+    if (!prog)
         uo[0] = s_umemo.valid[0] ? s_umemo.off[0] : 0;
     SPM(VKS_UBO);
-    nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
-                    (const uint8_t *)xbox_GetMemoryOffset(), vf);
-    memcpy(ip, idx, (size_t)nidx * 4u);
+    if (wide) {
+        nidx = nv2a_lines_expand(d, v, idx, nidx, lo, hi - lo + 1,
+                                 (const uint8_t *)xbox_GetMemoryOffset(), vf, (uint32_t *)ip);
+        if (!nidx) {
+            s_draws_skipped++;
+            return;
+        }
+    } else {
+        nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
+        memcpy(ip, idx, (size_t)nidx * 4u);
+    }
     SPM(VKS_GATHER);
     tset = texture_set(sview, ssmp);
     if (!tset) {
@@ -7646,8 +7669,11 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
 
     if (!rt->im.img || !rt->dirty || !pitch || pitch < rt->w * 2u)
         return;
-    if ((px = host_readback(rt)) != NULL)
+    if ((px = host_readback(rt)) != NULL) {
+        if (rt->hw != rt->w)
+            nv2a_pb_dump_host_px(px, rt->hw, rt->hh);   /* fb_dump_host (BO-385) */
         write_back_px(rt, px, rt->addr, pitch);
+    }
     rt->dirty = 0;
     rt_own_reset(rt);
 }

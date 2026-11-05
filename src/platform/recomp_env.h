@@ -275,6 +275,7 @@ extern "C" {
     X(PB_MIPS,           DEBUG, "pb_mips",         "RECOMP_PB_MIPS",           "=0: CPU raster samples mip level 0 only") \
     X(PB_CLIP,           DEBUG, "pb_clip",         "RECOMP_PB_CLIP",           "=0: no near-plane clipping") \
     X(ALPHA_KILL,        DEBUG, "alpha_kill",      "RECOMP_ALPHA_KILL",        "=0: GPU backends ignore TEXTURE_CONTROL0 ALPHA_KILL (BO-226)") \
+    X(WIDE_LINES,        DEBUG, "wide_lines",      NULL,                       "=0: lines at a render scale above 1 are drawn one host pixel wide, as before BO-385, not one guest pixel (Metal, Vulkan)") \
     X(PB_CULL_FLIP,      DEBUG, "pb_cull_flip",    "RECOMP_PB_CULL_FLIP",      "CPU raster culls the other winding") \
     X(PB_VSH_AB,         DEBUG, "pb_vsh_ab",       "RECOMP_PB_VSH_AB",         "compare vertex-program paths per batch") \
     X(PB_VSH_AB_DUMP,    DEBUG, "pb_vsh_ab_dump",  "RECOMP_PB_VSH_AB_DUMP",    "=prefix: pb_vsh_ab differing batches") \
@@ -417,6 +418,7 @@ extern "C" {
     X(TEXPACK_COMPRESS,  DEBUG, "texpack_compress", NULL,                      "=0: pack textures stay raw BGRA8 (default: big ones are compressed to BC1/BC3 where the backend can sample them)") \
     X(FB_DUMP_AT,        DEBUG, "fb_dump_at",      "RECOMP_FB_DUMP_AT",        "=flips: fb_dump at these flips; =@file: the list in that file, read again when it grows") \
     X(FB_DUMP_FLIPS,     DEBUG, "fb_dump_flips",   "RECOMP_FB_DUMP_FLIPS",     "=n: fb_dump every nth flip") \
+    X(FB_DUMP_HOST,      DEBUG, "fb_dump_host",    NULL,                       "=1: with fb_dump_at, a frame drawn at a render scale above 1 also at its host size, <fb_dump prefix>host_flip_NNNNN.bmp (Metal, Vulkan)") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \

@@ -223,6 +223,12 @@ if(NOT WIN32)
                      ${CMAKE_CURRENT_BINARY_DIR}/nv2a_vtx_gather)
 endif()
 
+# BO-385: line lists of a scaled target as quads (src/kernel/nv2a_wide_lines.c).
+if(NOT WIN32)
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/nv2a_wide_lines
+                     ${CMAKE_CURRENT_BINARY_DIR}/nv2a_wide_lines)
+endif()
+
 # The HLSL the parse -> generate pipeline emits, against recorded hashes
 # (every host: the emitters are API-free).
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_hlsl_split

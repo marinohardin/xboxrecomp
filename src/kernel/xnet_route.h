@@ -139,7 +139,8 @@ int xr_lan_denied(uint32_t title_ip, uint32_t to_ip);
 #define XR_HAS_LAN_DENIED 1
 /* Where hellos go: the route, and on one public address also the path
  * through the router (two homes behind one address); 0, 1 or 2 of them. */
-int xr_candidates(uint32_t title_ip, uint16_t title_port, xr_ep out[2]);
+#define XR_MAX_CAND 4
+int xr_candidates(uint32_t title_ip, uint16_t title_port, xr_ep out[XR_MAX_CAND]);
 /* whether src is a known peer's (learned path, local or public address) */
 int xr_known_source(xr_ep src);
 int xr_peer_count(void);
@@ -159,10 +160,18 @@ int xr_source_on(xr_ep src, uint16_t ltport, uint32_t *title_ip, uint16_t *title
 
 /* hellos */
 int  xr_hello_make(uint8_t *buf, uint16_t title_port);          /* XR_HELLO_LEN bytes */
+/* the same for one peer: byte 14 bit 1 says a direct hello of that peer
+ * reached this socket lately (the relay fallback switches to direct only
+ * when both sides say so, BO-381) */
+int  xr_hello_make_for(uint8_t *buf, uint16_t title_port, uint32_t peer);
 int  xr_is_hello(const uint8_t *buf, int n);
 /* a hello arrived from src (ms clock): what came of it */
 enum { XR_HELLO_OLD = 0, XR_HELLO_NEW = 1, XR_HELLO_BAD = -1, XR_HELLO_UNKNOWN = -2,
-       XR_HELLO_BADTAG = -3, XR_HELLO_WRONGSRC = -4 };
+       XR_HELLO_BADTAG = -3, XR_HELLO_WRONGSRC = -4,
+       /* BO-381: a direct hello heard while the path is the relay, but the
+        * peer does not hear us directly yet (its bit 1 is clear): nothing
+        * changes until it does */
+       XR_HELLO_ONEWAY = 2 };
 int  xr_hello_seen(xr_ep src, const uint8_t *buf, int n, uint32_t *title_ip, uint64_t now_ms);
 /* the same, the hello having reached our socket with title port ltport */
 int  xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *buf, int n, uint32_t *title_ip, uint64_t now_ms);
@@ -285,6 +294,71 @@ int  xr_is_vote(const uint8_t *buf, int n);
 int  xr_vote_seen(xr_ep src, const uint8_t *buf, int n, uint32_t *title_ip, uint64_t now_ms);
 /* a received vote packet not yet taken: 1, its sender and data, else 0 */
 int  xr_vote_get(uint32_t *title_ip, uint8_t data[XR_VOTE_DATA]);
+
+/* ── the relay fallback (BO-381) ───────────────────────────────────
+ * The lobby's host runs a UDP relay (TKRELAY=<port> in the member-only
+ * records). A peer whose own hello has not come 2 s after it became a
+ * member gets our hellos through the relay too; the first path to bring
+ * its hello carries the title's datagrams. A relay path is replaced by a
+ * direct one the moment a direct hello says the peer hears us directly as
+ * well (hello byte 14 bit 1). The relay's answer to a forwarded packet
+ * carries the peer's endpoint as the relay sees it: one more direct
+ * candidate for the hellos (the hole punch).
+ *
+ * A relayed datagram ("TKRL", XR_RELAY_HDR bytes then the payload):
+ *  0..3   "TKRL"
+ *  4      version (1)
+ *  5      kind: 1 data, 2 the relay's answer (payload = IPv4 + port)
+ *  6..9   the game's IDENT (big-endian)
+ *  10..13 from: the sender's title address (as the hellos)
+ *  14..17 to: the receiver's (0: bind only)
+ *  18..19 from title port, 20..21 to title port (big-endian)
+ *  22..23 zero
+ *  24..31 SipHash of bytes 0..23 under the game's secret
+ *  32..   the payload (at most XR_RELAY_PAYLOAD bytes) */
+#define XR_RELAY_HDR     32
+#define XR_RELAY_PAYLOAD 1400
+#define XR_RELAY_AFTER_MS       2000u   /* direct only this long after the peer joined */
+#define XR_RELAY_DIRECT_FAST_MS 20000u  /* direct hellos stay fast this long while on the relay */
+enum { XR_RELAY_DATA = 1, XR_RELAY_ANSWER = 2 };
+enum { XR_RELAY_OK = 0, XR_RELAY_BAD = -1, XR_RELAY_UNKNOWN = -2, XR_RELAY_BADTAG = -3, XR_RELAY_NOTME = -4 };
+/* the relay's endpoint (port 0: none); TKRELAY in a member record gives the
+ * port (xr_relay_port_seen), the lobby's address is the caller's */
+void  xr_relay_set(uint32_t ip, uint16_t port);
+xr_ep xr_relay_ep(void);
+uint16_t xr_relay_port_seen(void);
+/* the game's IDENT the member records name (the relay needs it) */
+void  xr_relay_game(int ident);
+/* the client side off (TAKEDAWN_NET_RELAY=0) */
+void  xr_relay_off(int off);
+/* whether src is the relay */
+int   xr_is_relay_src(xr_ep src);
+/* whether hellos to this peer's title port should go through the relay now */
+int   xr_relay_want(uint32_t title_ip, uint16_t title_port, uint64_t now_ms);
+/* whether the route to this peer's title port is the relay (xr_route gave
+ * the relay's endpoint: wrap the datagram) */
+int   xr_route_is_relay(uint32_t title_ip, uint16_t title_port);
+/* wrap payload for peer to, from our socket from_tport to its to_tport:
+ * the datagram's length, 0 when it cannot be (no relay, no secret, too
+ * long, no room) */
+int   xr_relay_wrap(uint8_t *out, int cap, uint32_t to, uint16_t from_tport, uint16_t to_tport,
+                    const uint8_t *payload, int n);
+int   xr_is_relay_pkt(const uint8_t *buf, int n);
+/* a TKRL datagram from the relay: XR_RELAY_OK with its sender, ports, kind
+ * and payload offset (the payload is n - off bytes) */
+int   xr_relay_unwrap(const uint8_t *buf, int n, uint32_t *from, uint16_t *from_tport,
+                      uint16_t *to_tport, int *kind, int *payload_off);
+/* a hello that came through the relay from peer from (its title port
+ * from_tport) to our socket ltport: as xr_hello_seen_on without the source
+ * check (the tag is the proof) */
+int   xr_relay_hello_seen(uint32_t from, uint16_t from_tport, uint16_t ltport, const uint8_t *buf, int n,
+                          uint64_t now_ms);
+/* the relay's answer: peer from's endpoint for its title port as the relay
+ * saw it (a direct candidate from now on) */
+void  xr_relay_answer(uint32_t from, uint16_t tport, xr_ep ep);
+/* a TKPG/TKRX/TKVT that came through the relay from peer id: the next
+ * xr_*_seen call takes the relay's endpoint as that peer's source (one call) */
+void  xr_relay_trust(uint32_t id);
 
 #ifdef __cplusplus
 }

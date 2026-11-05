@@ -4941,6 +4941,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0, zb_split = 0;
     float zbias = 0.0f, zb_applied = 0.0f;
     int solo = 0;                 /* BO-203: stage 0 is a stage0_only HDR picture */
+    int wide = 0;                 /* BO-385: a line list drawn as quads (vs_pass) */
+    int prog = d->program;        /* the batch runs its program on the GPU */
     /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
     int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
     int use_z = v->depth_enable || use_s;
@@ -5049,10 +5051,20 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             s_draws_skipped++;
             return;
         }
+        /* BO-385: a line one guest pixel wide at any render scale, as two
+         * triangles a segment through vs_pass (nv2a_lines_expand). */
+        if (nv2a_wide_lines(v, topo, rt->w, rt->hw)) {
+            wide = 1;
+            prog = 0;
+            vfn = s_vs_pass;
+            vid = PC_VS_PASS;
+            nf4 = VTX_F4;
+            topo = NV2A_TOPO_TRIANGLES;
+        }
         ptype = topo == NV2A_TOPO_POINTS ? MTLPrimitiveTypePoint
               : topo == NV2A_TOPO_LINES  ? MTLPrimitiveTypeLine
               :                            MTLPrimitiveTypeTriangle;
-        if (v->cull_enable) {     /* as the D3D11 backend's rasterizer_state */
+        if (v->cull_enable && !wide) {     /* as the D3D11 backend's rasterizer_state */
             if (v->cull_face == 0x405)      cull = 1;   /* BACK */
             else if (v->cull_face == 0x404) cull = 2;   /* FRONT */
             else if (v->cull_face == 0x408) cull_all = 1;
@@ -5063,13 +5075,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
 
         /* Rings first: an overflow flushes, which ends the open pass. */
+        if (wide)
+            count = 2u * nidx;            /* four corners a segment */
         vbytes = (NSUInteger)count * nf4 * 16u;
         if (vbytes < 16)
             vbytes = 16;
         vf = (float *)ring_alloc(s_vb, s_vb_size, &s_vb_pos, vbytes, &vb_off);
         {
             uint64_t fl = s_flushes;
-            ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos, (NSUInteger)nidx * 4u, &ib_off)
+            ip = vf ? ring_alloc(s_ib, s_ib_size, &s_ib_pos,
+                                 (NSUInteger)(wide ? 3u * nidx : nidx) * 4u, &ib_off)
                     : NULL;
             if (vf && ip && fl != s_flushes) {
                 /* The index ring overflowed after the vertices were placed,
@@ -5083,9 +5098,19 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* Each input as float4, fetched as the CPU path does; a disabled
          * one (or one without data) is its SET_VERTEX_DATA value. */
-        nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
-                        (const uint8_t *)xbox_GetMemoryOffset(), vf);
-        memcpy(ip, idx, (size_t)nidx * 4u);
+        if (wide) {
+            nidx = nv2a_lines_expand(d, v, idx, nidx, lo, hi - lo + 1,
+                                     (const uint8_t *)xbox_GetMemoryOffset(), vf,
+                                     (uint32_t *)ip);
+            if (!nidx) {
+                s_draws_skipped++;
+                return;
+            }
+        } else {
+            nv2a_vtx_gather(d, slot, nf4, lo, count, v->inl,
+                            (const uint8_t *)xbox_GetMemoryOffset(), vf);
+            memcpy(ip, idx, (size_t)nidx * 4u);
+        }
 
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, &vc);
 
@@ -5231,7 +5256,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             [s_enc setBlendColorRed:bf[0] green:bf[1] blue:bf[2] alpha:bf[3]];
         }
         [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
-        if (d->program) {
+        if (prog) {
             /* c[192] is 3 KB: under setVertexBytes' 4 KB. */
             [s_enc setVertexBytes:v->c length:sizeof v->c atIndex:1];
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
@@ -5247,7 +5272,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                          indexBuffer:s_ib indexBufferOffset:ib_off];
         if (zb_split) {
             vc.c[3] -= zb_applied;
-            if (d->program)
+            if (prog)
                 [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
             else
                 [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
@@ -5485,8 +5510,10 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
         s_ib_pos = ib;
         if (rt->hw == rt->w)
             write_back(rt, rt->addr, pitch);
-        else if ((px = host_readback(rt)) != NULL)
+        else if ((px = host_readback(rt)) != NULL) {
+            nv2a_pb_dump_host_px(px, rt->hw, rt->hh);
             write_back_scaled(rt, px, rt->addr, pitch);
+        }
         rt->dirty = 0;
         rt_own_reset(rt);
     }

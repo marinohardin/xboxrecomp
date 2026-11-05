@@ -23,6 +23,12 @@ typedef struct {
     int heard;                 /* a hello of its own came since it joined this game */
     int lan_denied;            /* BO-349: sends to its LAN address fail here: its public one */
     uint64_t touch;            /* when it was last used (s_clock), for eviction */
+    /* the relay fallback (BO-381): when our hellos to it began in this
+     * game (ms, 0 = not yet), whether its hello came through the relay, and
+     * the endpoints the relay's answers gave per title port */
+    uint64_t member_at;
+    int relay_heard;
+    struct { uint16_t tport; xr_ep ep; } disc[4];
     struct { uint16_t tport; xr_ep ep; const char *why; } last[4];   /* per port, for "changed" */
 } peer_t;
 
@@ -32,6 +38,7 @@ typedef struct {
     uint32_t id;
     uint16_t tport;
     uint64_t seen;             /* ms of the last hello from src */
+    int relay;                 /* src is the relay: the datagrams are wrapped (BO-381) */
 } learned_t;
 
 #define LEARNED_STALE_MS 30000 /* another path replaces a learned one after this */
@@ -58,6 +65,7 @@ typedef struct {
     uint16_t tport;
     uint64_t last;
     int sent;
+    uint64_t direct_in;        /* when the peer's last direct hello reached this port (BO-381) */
 } hello_t;
 
 static peer_t s_peer[MAX_PEERS];
@@ -80,6 +88,13 @@ static uint32_t s_self_synth;
  * reach the title */
 static int s_members_seen;
 static uint64_t s_clock;       /* counts peer uses, for eviction */
+/* the relay (BO-381): its endpoint (port 0: none), the port a member record
+ * named, the game's IDENT, the switch, and the one-call source trust */
+static xr_ep s_relay;
+static uint16_t s_relay_port_seen;
+static int s_relay_game;
+static int s_relay_off;
+static uint32_t s_relay_trust;
 
 /* the reactions channel's send bucket, per-sender receive buckets and queue
  * (below); the resets clear them too */
@@ -101,6 +116,10 @@ void xr_reset(void)
     s_force = 0;
     s_members_seen = 0;
     s_clock = 0;
+    memset(&s_relay, 0, sizeof s_relay);
+    s_relay_port_seen = 0;
+    s_relay_game = 0;
+    s_relay_trust = 0;
     react_clear();
     ping_clear(0);
 }
@@ -144,6 +163,9 @@ int xr_session_reset(void)
         s_has_secret = 0;
         s_secret_seq++;
     }
+    memset(&s_relay, 0, sizeof s_relay);
+    s_relay_port_seen = 0;
+    s_relay_game = 0;
     react_clear();
     ping_clear(0);
     return n;
@@ -462,6 +484,12 @@ void xr_lobby_body(const char *body, int n)
                     s_has_secret = 1;
                     s_secret_seq++;
                 }
+            } else if (kl == 7 && !memcmp(k, "TKRELAY", 7)) {
+                long port = 0;
+                int j;
+                for (j = vs; j < ve && body[j] >= '0' && body[j] <= '9' && port < 65536; j++)
+                    port = port * 10 + (body[j] - '0');
+                s_relay_port_seen = (port > 0 && port < 65536 && j == ve) ? (uint16_t)port : 0;
             } else if (kl == 2 && !memcmp(k, "LA", 2))
                 la = v;
             else if (kl == 5 && !memcmp(k, "TKRLA", 5))
@@ -528,6 +556,9 @@ static void member_new(peer_t *p)
 {
     int i;
     p->heard = 0;
+    p->member_at = 0;
+    p->relay_heard = 0;
+    memset(p->disc, 0, sizeof p->disc);
     for (i = 0; i < MAX_LEARNED; i++)
         if (s_hs[i].used && s_hs[i].id == p->id)
             s_hs[i].sent = 0;
@@ -695,7 +726,12 @@ int xr_route(uint32_t title_ip, uint16_t title_port, xr_ep *out, const char **wh
         l = NULL;
     if (l && p->lan_denied && p->pub && l->src.ip == lan)
         l = NULL;
-    if (l) {
+    if (l && l->relay && (!s_relay.port || s_relay_off))
+        l = NULL;
+    if (l && l->relay) {
+        ep = s_relay;
+        w = "through the relay (no direct path)";
+    } else if (l) {
         ep = l->src;
         w = "where its hello came from";
     } else if (!p->pub) {
@@ -761,30 +797,68 @@ int xr_lan_denied(uint32_t title_ip, uint32_t to_ip)
     return 1;
 }
 
-int xr_candidates(uint32_t title_ip, uint16_t title_port, xr_ep out[2])
+/* the endpoint the relay's answer gave for this peer's title port, if any */
+static const xr_ep *disc_for(const peer_t *p, uint16_t tport)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        if (p->disc[i].ep.port && p->disc[i].tport == tport)
+            return &p->disc[i].ep;
+    return NULL;
+}
+
+int xr_candidates(uint32_t title_ip, uint16_t title_port, xr_ep out[XR_MAX_CAND])
 {
     peer_t *p = find(title_ip, 0);
+    const learned_t *l;
     const char *w;
-    int ch, n = 0;
+    int n = 0, i;
     uint16_t off;
-    (void)ch;
+    const xr_ep *d;
     if (!p || xr_route(title_ip, title_port, &out[0], &w, NULL) != 1)
         return 0;
     n = 1;
-    {
-        const learned_t *l = learned_for(title_ip, title_port);
-        if (l && !(our_loopback(p, l->src) && (s_force || same24(lan_of(p), s_self_id) || same24(lan_of(p), s_self_lan))))
-            return n;
+    l = learned_for(title_ip, title_port);
+    if (l && l->relay && s_relay.port && !s_relay_off) {
+        /* the route is the relay: the hellos try the direct paths too (the
+         * guess as if no path were known), so a direct one can take over */
+        learned_t *lw = (learned_t *)l;
+        lw->relay = 0;
+        lw->used = 0;      /* hidden for one call */
+        if (xr_route(title_ip, title_port, &out[0], &w, NULL) != 1)
+            n = 0;
+        lw->used = 1;
+        lw->relay = 1;
+        l = NULL;
+        if (!n)
+            return 0;
     }
+    if (l && !(our_loopback(p, l->src) && (s_force || same24(lan_of(p), s_self_id) || same24(lan_of(p), s_self_lan))))
+        return n;
     off = p->has_off ? p->off : s_self_off;
     /* one network by the public address (or two homes behind one, CGNAT):
      * the other path too, through the router; whichever answers first wins */
     if (!s_force && p->pub && p->pub == s_self_pub && out[0].ip == lan_of(p)) {
-        out[1].ip = p->pub;
-        out[1].port = host_port(title_port, off);
-        n = 2;
+        out[n].ip = p->pub;
+        out[n].port = host_port(title_port, off);
+        n++;
+    }
+    /* the relay's answer said where that port really is (BO-381) */
+    d = disc_for(p, title_port);
+    if (d) {
+        for (i = 0; i < n; i++)
+            if (out[i].ip == d->ip && out[i].port == d->port)
+                break;
+        if (i == n && n < XR_MAX_CAND)
+            out[n++] = *d;
     }
     return n;
+}
+
+int xr_route_is_relay(uint32_t title_ip, uint16_t title_port)
+{
+    const learned_t *l = learned_for(title_ip, title_port);
+    return l && l->relay && s_relay.port && !s_relay_off;
 }
 
 int xr_known_source(xr_ep src)
@@ -949,6 +1023,21 @@ int xr_hello_make(uint8_t *b, uint16_t title_port)
     return XR_HELLO_LEN;
 }
 
+static hello_t *hello_for(uint32_t id, uint16_t tport, int make, uint64_t now);
+
+int xr_hello_make_for(uint8_t *b, uint16_t title_port, uint32_t peer)
+{
+    const hello_t *h = hello_for(peer, title_port, 0, 0);
+    int n = xr_hello_make(b, title_port);
+    /* bit 1: its direct hello reached this port lately, so it may leave the
+     * relay for the direct path (the tag is made after) */
+    if (h && h->direct_in && (h->last <= h->direct_in || h->last - h->direct_in < LEARNED_STALE_MS)) {
+        b[14] |= 2;
+        hello_tag(b, b + 16);
+    }
+    return n;
+}
+
 int xr_is_hello(const uint8_t *b, int n)
 {
     return n == XR_HELLO_LEN && !memcmp(b, "TKDH", 4) && b[4] == 2;
@@ -1028,14 +1117,16 @@ int xr_hello_seen(xr_ep src, const uint8_t *b, int n, uint32_t *title_ip, uint64
     return xr_hello_seen_on(src, 0, b, n, title_ip, now);
 }
 
-int xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32_t *title_ip, uint64_t now)
+static int hello_seen_impl(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32_t *title_ip,
+                           uint64_t now, int via_relay)
 {
     uint32_t id;
     uint16_t off, tport;
     peer_t *p;
     learned_t *l;
+    hello_t *h;
     uint8_t tag[8];
-    int i;
+    int i, both;
     if (title_ip)
         *title_ip = 0;
     if (!xr_is_hello(b, n))
@@ -1058,19 +1149,22 @@ int xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32
     /* from that player's own addresses: its public one (a router may change
      * the port, not the address), its local one, or, when it shares our
      * public address, any address of the local network (NAT loopback shows
-     * the router's own) */
-    if (!((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
-          (p->pub && p->pub == s_self_pub && xr_is_private(src.ip))))
+     * the router's own). Through the relay the tag is the proof. */
+    if (!via_relay && !((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
+                        (p->pub && p->pub == s_self_pub && xr_is_private(src.ip))))
         return XR_HELLO_WRONGSRC;
     ping_can(id, b[14] & 1);
     if (!p->has_off) {
         p->off = off;
         p->has_off = 1;
     }
-    rx_note(src, ltport ? ltport : tport, id, tport, now);
+    if (via_relay)
+        p->relay_heard = 1;
+    else
+        rx_note(src, ltport ? ltport : tport, id, tport, now);
     /* The test switch: only a path through the router counts, not the
      * local network's direct one. */
-    if (s_force && src.ip == lan_of(p))
+    if (s_force && !via_relay && src.ip == lan_of(p))
         return XR_HELLO_OLD;
     /* its first hello in this game: it knows us now, and our hellos so far
      * may have reached it before it did and been refused, so the next
@@ -1081,11 +1175,40 @@ int xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32
             if (s_hs[i].used && s_hs[i].id == id)
                 s_hs[i].sent = 0;
     }
+    /* a direct hello: noted for our own hellos' bit 1 (it hears us
+     * directly when that bit comes back) */
+    h = hello_for(id, tport, 1, now);
+    if (!via_relay && h)
+        h->direct_in = now;
+    both = (b[14] & 2) != 0;
     l = learned_for(id, tport);
     if (l) {
+        if (l->relay && !via_relay) {
+            /* on the relay: the direct path takes over only once the peer
+             * says it hears us directly too (one-way paths would lose the
+             * link), else the relay stays */
+            if (!both)
+                return XR_HELLO_ONEWAY;
+            l->src = src;
+            l->seen = now;
+            l->relay = 0;
+            learned_new(l);
+            return XR_HELLO_NEW;
+        }
+        if (!l->relay && via_relay) {
+            /* a direct path is better than the relay while it is alive */
+            if (now - l->seen < LEARNED_STALE_MS)
+                return XR_HELLO_OLD;
+            l->src = src;
+            l->seen = now;
+            l->relay = 1;
+            learned_new(l);
+            return XR_HELLO_NEW;
+        }
         if (l->src.ip == src.ip && l->src.port == src.port) {
             l->seen = now;
-            learned_claim(l);
+            if (!l->relay)
+                learned_claim(l);
             return XR_HELLO_OLD;
         }
         /* another path: the same address with a new port (the router moved
@@ -1118,42 +1241,72 @@ int xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32
     s_learn[i].id = id;
     s_learn[i].tport = tport;
     s_learn[i].seen = now;
+    s_learn[i].relay = via_relay;
     learned_new(&s_learn[i]);
     return XR_HELLO_NEW;
 }
 
+int xr_hello_seen_on(xr_ep src, uint16_t ltport, const uint8_t *b, int n, uint32_t *title_ip, uint64_t now)
+{
+    return hello_seen_impl(src, ltport, b, n, title_ip, now, 0);
+}
+
+/* the hello schedule's record for (id, tport), made when make is set (a
+ * full table gives up the one that went longest without a hello) */
+static hello_t *hello_for(uint32_t id, uint16_t tport, int make, uint64_t now)
+{
+    hello_t *h;
+    int i, old = 0;
+    (void)now;
+    for (i = 0; i < MAX_LEARNED; i++)
+        if (s_hs[i].used && s_hs[i].id == id && s_hs[i].tport == tport)
+            return &s_hs[i];
+    if (!make)
+        return NULL;
+    for (i = 0; i < MAX_LEARNED && s_hs[i].used; i++)
+        if (s_hs[i].last < s_hs[old].last)
+            old = i;
+    if (i == MAX_LEARNED)
+        i = old;
+    h = &s_hs[i];
+    memset(h, 0, sizeof *h);
+    h->used = 1;
+    h->id = id;
+    h->tport = tport;
+    return h;
+}
+
 int xr_hello_due(uint32_t title_ip, uint16_t title_port, uint64_t now)
 {
-    hello_t *h = NULL;
-    const peer_t *p = find(title_ip, 0);
-    int i, got;
+    hello_t *h;
+    peer_t *p = find(title_ip, 0);
+    const learned_t *l;
+    int got;
     if (!p)
         return 0;
-    for (i = 0; i < MAX_LEARNED; i++)
-        if (s_hs[i].used && s_hs[i].id == title_ip && s_hs[i].tport == title_port) {
-            h = &s_hs[i];
-            break;
-        }
-    if (!h) {
-        int old = 0;
-        for (i = 0; i < MAX_LEARNED && s_hs[i].used; i++)
-            if (s_hs[i].last < s_hs[old].last)
-                old = i;
-        if (i == MAX_LEARNED)
-            i = old;   /* full: the one that went longest without a hello */
-        h = &s_hs[i];
-        memset(h, 0, sizeof *h);
-        h->used = 1;
-        h->id = title_ip;
-        h->tport = title_port;
-    }
-    /* the keep-alive only once its own hello came (in this game, member_new) */
-    got = learned_for(title_ip, title_port) != NULL && p->heard;
+    h = hello_for(title_ip, title_port, 1, now);
+    if (!p->member_at)
+        p->member_at = now;   /* our hellos to it begin: the relay waits XR_RELAY_AFTER_MS */
+    /* the keep-alive only once its own hello came (in this game, member_new);
+     * on the relay the fast rate stays a while longer, so a direct path can
+     * still be found (BO-381) */
+    l = learned_for(title_ip, title_port);
+    got = l != NULL && p->heard && (!l->relay || now - p->member_at >= XR_RELAY_DIRECT_FAST_MS);
     if (h->sent && now - h->last < (uint64_t)(got ? HELLO_KEEP_MS : HELLO_FAST_MS))
         return 0;
     h->sent++;
     h->last = now;
     return 1;
+}
+
+/* a TKPG/TKRX/TKVT from the relay's endpoint is peer p's when the caller
+ * said so for this one call (xr_relay_trust: it unwrapped the datagram and
+ * checked its tag) */
+static int relay_src_ok(xr_ep src, const peer_t *p)
+{
+    int ok = s_relay.port && src.ip == s_relay.ip && src.port == s_relay.port && s_relay_trust == p->id;
+    s_relay_trust = 0;
+    return ok;
 }
 
 /* ── the reactions side channel (BO-352), see xnet_route.h ───────── */
@@ -1324,7 +1477,7 @@ int xr_react_seen(xr_ep src, const uint8_t *b, int n, uint32_t *title_ip,
     if (memcmp(tag, b + 24, 8))
         return XR_REACT_BADTAG;
     /* from that player's own addresses, the same rule as its hellos */
-    if (!((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
+    if (!relay_src_ok(src, p) && !((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
           (p->pub && p->pub == s_self_pub && xr_is_private(src.ip))))
         return XR_REACT_WRONGSRC;
     seq = (uint32_t)b[10] << 24 | (uint32_t)b[11] << 16 | (uint32_t)b[12] << 8 | b[13];
@@ -1511,7 +1664,7 @@ int xr_ping_seen(xr_ep src, const uint8_t *b, int n, uint32_t *title_ip, uint8_t
     ping_tag(b, tag);
     if (memcmp(tag, b + 24, 8))
         return XR_PING_BADTAG;
-    if (!((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
+    if (!relay_src_ok(src, p) && !((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
           (p->pub && p->pub == s_self_pub && xr_is_private(src.ip))))
         return XR_PING_WRONGSRC;
     seq = (uint32_t)b[10] << 24 | (uint32_t)b[11] << 16 | (uint32_t)b[12] << 8 | b[13];
@@ -1644,7 +1797,7 @@ int xr_vote_seen(xr_ep src, const uint8_t *b, int n, uint32_t *title_ip, uint64_
     vote_tag(b, tag);
     if (memcmp(tag, b + 40, 8))
         return XR_REACT_BADTAG;
-    if (!((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
+    if (!relay_src_ok(src, p) && !((src.ip == lan_of(p) && local_ok(p)) || (p->pub && src.ip == p->pub) ||
           (p->pub && p->pub == s_self_pub && xr_is_private(src.ip))))
         return XR_REACT_WRONGSRC;
     seq = (uint32_t)b[10] << 24 | (uint32_t)b[11] << 16 | (uint32_t)b[12] << 8 | b[13];
@@ -1690,4 +1843,147 @@ int xr_vote_get(uint32_t *title_ip, uint8_t data[XR_VOTE_DATA])
     s_vote_q_head = (s_vote_q_head + 1) % VOTE_QUEUE;
     s_vote_q_n--;
     return 1;
+}
+
+/* ── the relay fallback (BO-381), see xnet_route.h ─────────────────── */
+
+void xr_relay_set(uint32_t ip, uint16_t port)
+{
+    s_relay.ip = port ? ip : 0;
+    s_relay.port = ip ? port : 0;
+}
+
+xr_ep xr_relay_ep(void) { return s_relay; }
+uint16_t xr_relay_port_seen(void) { return s_relay_port_seen; }
+void xr_relay_game(int ident) { s_relay_game = ident; }
+void xr_relay_off(int off) { s_relay_off = off; }
+void xr_relay_trust(uint32_t id) { s_relay_trust = id; }
+
+int xr_is_relay_src(xr_ep src)
+{
+    return s_relay.port && src.ip == s_relay.ip && src.port == s_relay.port;
+}
+
+int xr_relay_want(uint32_t title_ip, uint16_t title_port, uint64_t now)
+{
+    const peer_t *p = find(title_ip, 0);
+    const learned_t *l;
+    if (!p || !p->member || !s_relay.port || s_relay_off || !s_has_secret || !s_relay_game)
+        return 0;
+    l = learned_for(title_ip, title_port);
+    if (l && !l->relay)
+        return 0;   /* a direct path: nothing to fall back from */
+    if (p->relay_heard)
+        return 1;   /* it reached us through the relay: answer in kind at once */
+    return p->member_at && now - p->member_at >= XR_RELAY_AFTER_MS;
+}
+
+static void relay_tag(const uint8_t *b, uint8_t *tag)
+{
+    uint64_t t = s_has_secret ? xr_siphash(s_secret, b, 24) : 0;
+    int i;
+    for (i = 0; i < 8; i++)
+        tag[i] = (uint8_t)(t >> (8 * i));
+}
+
+int xr_relay_wrap(uint8_t *out, int cap, uint32_t to, uint16_t from_tport, uint16_t to_tport,
+                  const uint8_t *payload, int n)
+{
+    uint32_t id = s_self_synth ? s_self_synth : s_self_id;
+    if (!s_relay.port || s_relay_off || !s_has_secret || !s_relay_game || n < 0 || n > XR_RELAY_PAYLOAD ||
+        cap < XR_RELAY_HDR + n)
+        return 0;
+    memset(out, 0, XR_RELAY_HDR);
+    memcpy(out, "TKRL", 4);
+    out[4] = 1;
+    out[5] = XR_RELAY_DATA;
+    out[6] = (uint8_t)((uint32_t)s_relay_game >> 24);
+    out[7] = (uint8_t)((uint32_t)s_relay_game >> 16);
+    out[8] = (uint8_t)((uint32_t)s_relay_game >> 8);
+    out[9] = (uint8_t)s_relay_game;
+    memcpy(out + 10, &id, 4);
+    memcpy(out + 14, &to, 4);
+    out[18] = (uint8_t)(from_tport >> 8); out[19] = (uint8_t)from_tport;
+    out[20] = (uint8_t)(to_tport >> 8);   out[21] = (uint8_t)to_tport;
+    relay_tag(out, out + 24);
+    if (n)
+        memcpy(out + XR_RELAY_HDR, payload, (size_t)n);
+    return XR_RELAY_HDR + n;
+}
+
+int xr_is_relay_pkt(const uint8_t *b, int n)
+{
+    return n >= XR_RELAY_HDR && !memcmp(b, "TKRL", 4) && b[4] == 1;
+}
+
+int xr_relay_unwrap(const uint8_t *b, int n, uint32_t *from, uint16_t *from_tport,
+                    uint16_t *to_tport, int *kind, int *payload_off)
+{
+    uint32_t f, t, me = s_self_synth ? s_self_synth : s_self_id;
+    int ident;
+    uint8_t tag[8];
+    const peer_t *p;
+    if (!xr_is_relay_pkt(b, n) || n > XR_RELAY_HDR + XR_RELAY_PAYLOAD)
+        return XR_RELAY_BAD;
+    if (b[5] != XR_RELAY_DATA && b[5] != XR_RELAY_ANSWER)
+        return XR_RELAY_BAD;
+    ident = (int)((uint32_t)b[6] << 24 | (uint32_t)b[7] << 16 | (uint32_t)b[8] << 8 | b[9]);
+    memcpy(&f, b + 10, 4);
+    memcpy(&t, b + 14, 4);
+    if (from) *from = f;
+    if (from_tport) *from_tport = (uint16_t)(b[18] << 8 | b[19]);
+    if (to_tport) *to_tport = (uint16_t)(b[20] << 8 | b[21]);
+    if (kind) *kind = b[5];
+    if (payload_off) *payload_off = XR_RELAY_HDR;
+    if (!s_has_secret || !s_relay_game || ident != s_relay_game)
+        return XR_RELAY_UNKNOWN;
+    if (!f || f == me)
+        return XR_RELAY_BAD;
+    p = find(f, 0);
+    if (!p || !member_ok(p))
+        return XR_RELAY_UNKNOWN;
+    relay_tag(b, tag);
+    if (memcmp(tag, b + 24, 8))
+        return XR_RELAY_BADTAG;
+    if (t != me)
+        return XR_RELAY_NOTME;
+    return XR_RELAY_OK;
+}
+
+int xr_relay_hello_seen(uint32_t from, uint16_t from_tport, uint16_t ltport, const uint8_t *b, int n,
+                        uint64_t now)
+{
+    uint32_t id = 0;
+    int r;
+    if (!xr_is_hello(b, n))
+        return XR_HELLO_BAD;
+    memcpy(&id, b + 6, 4);
+    if (id != from || (uint16_t)(b[12] << 8 | b[13]) != from_tport)
+        return XR_HELLO_BAD;   /* the wrapper and the hello disagree */
+    r = hello_seen_impl(s_relay, ltport, b, n, &id, now, 1);
+    return r;
+}
+
+void xr_relay_answer(uint32_t from, uint16_t tport, xr_ep ep)
+{
+    peer_t *p = find(from, 0);
+    int i, slot = -1;
+    if (!p || !ep.ip || !ep.port)
+        return;
+    /* only a public address or one on our own network, never a third party
+     * the relay could not have seen (and never ourselves) */
+    if (xr_is_private(ep.ip) && !(s_self_pub && p->pub == s_self_pub))
+        return;
+    for (i = 0; i < 4; i++) {
+        if (p->disc[i].ep.port && p->disc[i].tport == tport) {
+            slot = i;
+            break;
+        }
+        if (!p->disc[i].ep.port && slot < 0)
+            slot = i;
+    }
+    if (slot < 0)
+        slot = 0;
+    p->disc[slot].tport = tport;
+    p->disc[slot].ep = ep;
 }
